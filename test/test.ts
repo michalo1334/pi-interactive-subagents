@@ -43,7 +43,12 @@ import {
   observeStatus,
   loadStatusConfig,
   parseStatusConfig,
+  parseSubagentConfig,
 } from "../pi-extension/subagents/status.ts";
+import {
+  buildCodexFastModePayload,
+  isSubagentProcess,
+} from "../pi-extension/subagents/fast-mode.ts";
 import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
@@ -53,6 +58,7 @@ import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
+  registerSubagentProviderRequestHandler,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
 
@@ -82,16 +88,20 @@ function createMockExtensionApi() {
   const registeredTools: Array<any> = [];
   const registeredCommands: Array<any> = [];
   const registeredMessageRenderers: Array<any> = [];
+  const registeredHandlers: Array<{ event: string; handler: any }> = [];
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
   return {
     registeredTools,
     registeredCommands,
     registeredMessageRenderers,
+    registeredHandlers,
     sentUserMessages,
     sentMessages,
     api: {
-      on() {},
+      on(event: string, handler: any) {
+        registeredHandlers.push({ event, handler });
+      },
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
@@ -487,6 +497,21 @@ describe("status.ts", () => {
     });
   });
 
+  it("defaults Codex Fast mode to disabled and accepts explicit values", () => {
+    assert.deepEqual(parseSubagentConfig({ status: { enabled: true } }), {
+      status: { enabled: true, lineLimit: 4 },
+      codexFastMode: false,
+    });
+    assert.equal(
+      parseSubagentConfig({ status: { enabled: true }, codexFastMode: true }).codexFastMode,
+      true,
+    );
+    assert.equal(
+      parseSubagentConfig({ status: { enabled: true }, codexFastMode: false }).codexFastMode,
+      false,
+    );
+  });
+
   it("loads a valid config file", () => {
     const examplePath = fileURLToPath(new URL("../config.json.example", import.meta.url));
     const config = loadStatusConfig(examplePath);
@@ -522,6 +547,14 @@ describe("status.ts", () => {
     assert.throws(
       () => parseStatusConfig({ status: { enabled: true, defaultCadenceSeconds: 60 } }),
       /status has unsupported key\(s\): defaultCadenceSeconds/,
+    );
+    assert.throws(
+      () => parseSubagentConfig({ status: { enabled: true }, codexFastMode: "true" }),
+      /codexFastMode must be a boolean/,
+    );
+    assert.throws(
+      () => parseSubagentConfig({ status: { enabled: true }, unsupported: true }),
+      /root has unsupported key\(s\): unsupported/,
     );
   });
 
@@ -1216,6 +1249,82 @@ describe("subagent discovery", () => {
     });
   });
 });
+describe("fast-mode.ts", () => {
+  const supportedCodexModel = {
+    provider: "openai-codex",
+    api: "openai-codex-responses",
+    id: "gpt-5.5",
+  };
+
+  it("adds priority only for enabled, supported Codex requests", () => {
+    assert.deepEqual(
+      buildCodexFastModePayload(true, { model: "gpt-5.5", input: "task" }, supportedCodexModel),
+      { model: "gpt-5.5", input: "task", service_tier: "priority" },
+    );
+  });
+
+  it("does not change disabled, non-Codex, unknown, or malformed requests", () => {
+    assert.equal(
+      buildCodexFastModePayload(false, { model: "gpt-5.5" }, supportedCodexModel),
+      undefined,
+    );
+    assert.equal(
+      buildCodexFastModePayload(
+        true,
+        { model: "gpt-5.5" },
+        { provider: "openai", api: "openai-responses", id: "gpt-5.5" },
+      ),
+      undefined,
+    );
+    assert.equal(
+      buildCodexFastModePayload(
+        true,
+        { model: "gpt-5.6-terra" },
+        { ...supportedCodexModel, id: "gpt-5.6-terra" },
+      ),
+      undefined,
+    );
+    assert.equal(buildCodexFastModePayload(true, "not an object", supportedCodexModel), undefined);
+  });
+
+  it("preserves an explicit service tier", () => {
+    assert.equal(
+      buildCodexFastModePayload(
+        true,
+        { model: "gpt-5.5", service_tier: "default" },
+        supportedCodexModel,
+      ),
+      undefined,
+    );
+  });
+
+  it("enables the hook only in a child process", () => {
+    assert.equal(isSubagentProcess({}), false);
+    assert.equal(isSubagentProcess({ PI_SUBAGENT_ID: "child-1" }), true);
+  });
+
+  it("registers the child request hook and transforms the real request payload", () => {
+    const registered: Array<{ event: string; handler: any }> = [];
+    let recorded = 0;
+    registerSubagentProviderRequestHandler(
+      { on: (event: string, handler: any) => registered.push({ event, handler }) } as any,
+      { beforeProviderRequest: () => { recorded += 1; } },
+      true,
+    );
+
+    assert.equal(registered.length, 1);
+    assert.equal(registered[0].event, "before_provider_request");
+    assert.deepEqual(
+      registered[0].handler(
+        { payload: { model: "gpt-5.5" } },
+        { model: supportedCodexModel },
+      ),
+      { model: "gpt-5.5", service_tier: "priority" },
+    );
+    assert.equal(recorded, 1);
+  });
+});
+
 describe("subagent-done.ts", () => {
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {

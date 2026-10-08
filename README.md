@@ -139,9 +139,12 @@ cp config.json.example config.json
 {
   "status": {
     "enabled": true
-  }
+  },
+  "codexFastMode": false
 }
 ```
+
+Set `codexFastMode` to `true` to request Codex Fast mode for supported Pi-backed subagents. The extension changes only child requests. It sends `service_tier: "priority"` only for known compatible OpenAI Codex Responses models. It keeps an existing `service_tier` value unchanged. Unsupported and unknown models use normal mode.
 
 `config.json` is gitignored so local overrides don't get committed.
 
