@@ -1020,6 +1020,11 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("does not discover the removed visual-tester agent", () => {
+    const discovered = testApi.discoverAgentDefinitions();
+    assert.equal(discovered.some((agent: any) => agent.name === "visual-tester"), false);
+  });
+
   it("bundled scout/worker/reviewer agents resolve as non-interactive; planner resolves as interactive", () => {
     for (const name of ["scout", "worker", "reviewer"]) {
       const defs = testApi.loadAgentDefaults(name);
