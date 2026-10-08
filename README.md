@@ -79,14 +79,14 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 ### Bundled Agents
 
-| Agent             | Model                  | Role                                                                                     |
-| ----------------- | ---------------------- | ---------------------------------------------------------------------------------------- |
-| **planner**       | Opus (medium thinking) | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
-| **scout**         | Haiku                  | Fast codebase reconnaissance — maps files, patterns, conventions                         |
-| **worker**        | Sonnet                 | Implements tasks from todos — writes code, runs tests, makes polished commits            |
-| **reviewer**      | Opus (medium thinking) | Reviews code for bugs, security issues, correctness                                      |
+| Agent         | Role                                                                                     |
+| ------------- | ---------------------------------------------------------------------------------------- |
+| **planner**   | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
+| **scout**     | Fast codebase reconnaissance — maps files, patterns, conventions                         |
+| **worker**    | Implements tasks from todos — writes code, runs tests, makes polished commits            |
+| **reviewer**  | Reviews code for bugs, security issues, correctness                                      |
 
-Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
+The Markdown files in `agents/` define each agent's model default. Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
 
 ---
 
