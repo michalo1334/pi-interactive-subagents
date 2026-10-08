@@ -8,8 +8,6 @@ import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
-import { buildCodexFastModePayload, isSubagentProcess } from "./fast-mode.ts";
-import { loadSubagentConfig } from "./status.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -77,22 +75,6 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
-export interface ProviderRequestRecorder {
-  beforeProviderRequest(): void;
-}
-
-/** Register the child-only request hook that can enable Codex Fast mode. */
-export function registerSubagentProviderRequestHandler(
-  pi: ExtensionAPI,
-  recorder: ProviderRequestRecorder,
-  codexFastModeEnabled: boolean,
-): void {
-  pi.on("before_provider_request", (event, ctx) => {
-    recorder.beforeProviderRequest();
-    return buildCodexFastModePayload(codexFastModeEnabled, event.payload, ctx.model);
-  });
-}
-
 export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
@@ -103,8 +85,7 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
-  const config = loadSubagentConfig();
-  const codexFastModeEnabled = config.codexFastMode && isSubagentProcess();
+  const isSubagent = Boolean(process.env.PI_SUBAGENT_ID);
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -240,8 +221,10 @@ export default function (pi: ExtensionAPI) {
     recorder.turnEnd((event as any).turnIndex);
   });
 
-  if (isSubagentProcess()) {
-    registerSubagentProviderRequestHandler(pi, recorder, codexFastModeEnabled);
+  if (isSubagent) {
+    pi.on("before_provider_request", () => {
+      recorder.beforeProviderRequest();
+    });
   }
 
   pi.on("after_provider_response", () => {

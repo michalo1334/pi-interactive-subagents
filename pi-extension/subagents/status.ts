@@ -22,11 +22,6 @@ export interface StatusConfig {
   lineLimit: number;
 }
 
-export interface SubagentConfig {
-  status: StatusConfig;
-  codexFastMode: boolean;
-}
-
 export type StatusObservation =
   | {
       snapshot: "present";
@@ -142,29 +137,18 @@ function activityLabel(snapshot: Pick<StatusSnapshot, "activityLabel" | "activeS
   return snapshot.activityLabel ?? snapshot.activeScope;
 }
 
-export function parseSubagentConfig(rawConfig: unknown, source = "config.json"): SubagentConfig {
+export function parseStatusConfig(rawConfig: unknown, source = "config.json"): StatusConfig {
   const config = requireObject(rawConfig, source, "root");
-  rejectUnsupportedKeys(config, ["status", "codexFastMode"], source, "root");
+  rejectUnsupportedKeys(config, ["status"], source, "root");
 
   const status = requireObject(config.status, source, "status");
   rejectUnsupportedKeys(status, ["enabled"], source, "status");
   const enabled = requireBoolean(status.enabled, source, "status.enabled");
 
-  const codexFastMode = config.codexFastMode === undefined
-    ? false
-    : requireBoolean(config.codexFastMode, source, "codexFastMode");
-
   return {
-    status: {
-      enabled,
-      lineLimit: DEFAULT_STATUS_LINE_LIMIT,
-    },
-    codexFastMode,
+    enabled,
+    lineLimit: DEFAULT_STATUS_LINE_LIMIT,
   };
-}
-
-export function parseStatusConfig(rawConfig: unknown, source = "config.json"): StatusConfig {
-  return parseSubagentConfig(rawConfig, source).status;
 }
 
 function readStatusConfigFile(configPath: string, examplePath: string): { sourcePath: string; rawConfig: string } {
@@ -188,10 +172,10 @@ function readStatusConfigFile(configPath: string, examplePath: string): { source
   }
 }
 
-export function loadSubagentConfig(
+export function loadStatusConfig(
   configPath = DEFAULT_STATUS_CONFIG_PATH,
   examplePath = STATUS_CONFIG_EXAMPLE_PATH,
-): SubagentConfig {
+): StatusConfig {
   const { sourcePath, rawConfig } = readStatusConfigFile(configPath, examplePath);
 
   let parsed: unknown;
@@ -202,14 +186,7 @@ export function loadSubagentConfig(
     throw new Error(`Invalid JSON in subagent config ${sourcePath}: ${detail}`);
   }
 
-  return parseSubagentConfig(parsed, sourcePath);
-}
-
-export function loadStatusConfig(
-  configPath = DEFAULT_STATUS_CONFIG_PATH,
-  examplePath = STATUS_CONFIG_EXAMPLE_PATH,
-): StatusConfig {
-  return loadSubagentConfig(configPath, examplePath).status;
+  return parseStatusConfig(parsed, sourcePath);
 }
 
 export function formatElapsedDuration(ms: number): string {
