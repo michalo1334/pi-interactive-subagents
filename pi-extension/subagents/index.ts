@@ -64,6 +64,51 @@ const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 
+interface PollAbortControllerSlot {
+  controller?: AbortController;
+}
+
+interface ModulePollAbortLifecycle {
+  getSignal(): AbortSignal;
+  startSession(): void;
+  shutdown(reason?: unknown): void;
+}
+
+function formatLifecycleReason(reason: unknown): string {
+  return typeof reason === "string" && reason.trim() !== "" ? reason : "unknown";
+}
+
+function createModulePollAbortLifecycle(slot: PollAbortControllerSlot): ModulePollAbortLifecycle {
+  const previousController = slot.controller;
+  previousController?.abort(new Error("module lifecycle abort: extension module reloaded"));
+
+  let controller = new AbortController();
+  slot.controller = controller;
+
+  return {
+    getSignal() {
+      return controller.signal;
+    },
+    startSession() {
+      if (!controller.signal.aborted) return;
+
+      const stoppedController = controller;
+      controller = new AbortController();
+
+      // Publish the renewed controller only if this module still owns the slot.
+      // An old module can receive a late lifecycle event after /reload.
+      if (slot.controller === stoppedController) slot.controller = controller;
+    },
+    shutdown(reason) {
+      controller.abort(
+        new Error(
+          `module lifecycle abort: parent session shutdown (${formatLifecycleReason(reason)})`,
+        ),
+      );
+    },
+  };
+}
+
 {
   const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
   if (prevInterval) {
@@ -75,13 +120,20 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
     clearInterval(prevStatusInterval);
     (globalThis as any)[STATUS_INTERVAL_KEY] = null;
   }
-  const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-  if (prevAbort) prevAbort.abort();
-  (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
 }
 
+const globalPollAbortControllerSlot: PollAbortControllerSlot = {
+  get controller() {
+    return (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
+  },
+  set controller(value: AbortController | undefined) {
+    (globalThis as any)[POLL_ABORT_KEY] = value;
+  },
+};
+const modulePollAbortLifecycle = createModulePollAbortLifecycle(globalPollAbortControllerSlot);
+
 function getModuleAbortSignal(): AbortSignal {
-  return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
+  return modulePollAbortLifecycle.getSignal();
 }
 
 const SubagentParams = Type.Object({
@@ -911,6 +963,7 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  createModulePollAbortLifecycle,
   runningSubagents,
   formatElapsed,
 };
@@ -1335,11 +1388,12 @@ async function watchSubagent(
     } catch {}
     runningSubagents.delete(running.id);
 
+    const errorDetail = err?.message ?? String(err);
     if (signal.aborted) {
       return {
         name,
         task,
-        summary: "Subagent cancelled.",
+        summary: `Subagent cancelled. ${errorDetail}`,
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: "cancelled",
@@ -1349,10 +1403,11 @@ async function watchSubagent(
     return {
       name,
       task,
-      summary: `Subagent error: ${err?.message ?? String(err)}`,
+      summary: `Subagent error: ${errorDetail}`,
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
-      error: err?.message ?? String(err),
+      error: errorDetail,
+      sessionFile,
     };
   }
 }
@@ -1360,11 +1415,12 @@ async function watchSubagent(
 export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
+    modulePollAbortLifecycle.startSession();
     latestCtx = ctx;
   });
 
   // Clean up on session shutdown
-  pi.on("session_shutdown", (_event, _ctx) => {
+  pi.on("session_shutdown", (event, _ctx) => {
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -1375,10 +1431,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       statusInterval = null;
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
-    const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-    if (moduleAbort) moduleAbort.abort();
+    const shutdownReason = (event as any)?.reason;
+    modulePollAbortLifecycle.shutdown(shutdownReason);
     for (const [_id, agent] of runningSubagents) {
-      agent.abortController?.abort();
+      agent.abortController?.abort(
+        new Error(
+          `watcher abort: parent session shutdown (${formatLifecycleReason(shutdownReason)})`,
+        ),
+      );
     }
     runningSubagents.clear();
   });

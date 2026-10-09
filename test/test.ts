@@ -30,6 +30,7 @@ import {
   predictZellijSplitDirection,
   selectZellijPlacement,
   selectZellijStackPlacement,
+  pollForExit,
 } from "../pi-extension/subagents/cmux.ts";
 import {
   advanceStatusState,
@@ -1304,6 +1305,62 @@ describe("subagent-done.ts", () => {
       assert.equal(findLatestAssistantError(undefined), null);
       assert.equal(findLatestAssistantError([]), null);
     });
+  });
+});
+
+describe("module poll abort lifecycle", () => {
+  // HARNESS-ABORT-01 (Unit)
+  // WHEN a new extension module starts before the old module shuts down,
+  // THE old shutdown SHALL NOT abort the new module's poll signal.
+  it("keeps a newer module signal active when the old module shuts down", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const slot: { controller?: AbortController } = {};
+    const oldLifecycle = testApi.createModulePollAbortLifecycle(slot);
+    const newLifecycle = testApi.createModulePollAbortLifecycle(slot);
+
+    assert.equal(oldLifecycle.getSignal().aborted, true);
+    assert.match(String(oldLifecycle.getSignal().reason), /reloaded/i);
+    assert.equal(newLifecycle.getSignal().aborted, false);
+
+    oldLifecycle.shutdown("reload");
+
+    assert.equal(newLifecycle.getSignal().aborted, false);
+  });
+
+  // HARNESS-ABORT-02 (Unit)
+  // WHEN Pi starts a new session after session shutdown,
+  // THE extension SHALL replace its aborted poll signal.
+  it("renews its poll signal when a new session starts", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const slot: { controller?: AbortController } = {};
+    const lifecycle = testApi.createModulePollAbortLifecycle(slot);
+    const firstSignal = lifecycle.getSignal();
+
+    lifecycle.shutdown("resume");
+    assert.equal(firstSignal.aborted, true);
+    assert.match(String(firstSignal.reason), /resume/i);
+
+    lifecycle.startSession();
+    const renewedSignal = lifecycle.getSignal();
+
+    assert.notEqual(renewedSignal, firstSignal);
+    assert.equal(renewedSignal.aborted, false);
+    assert.equal(slot.controller?.signal, renewedSignal);
+  });
+});
+
+describe("cmux.ts pollForExit abort diagnostics", () => {
+  // HARNESS-ABORT-03 (Unit)
+  // WHEN the poll signal aborts with a lifecycle reason,
+  // THE rejection SHALL identify that reason.
+  it("includes the abort reason in the poll error", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("module lifecycle abort: parent session shutdown (reload)"));
+
+    await assert.rejects(
+      pollForExit("unused-surface", controller.signal, { interval: 1 }),
+      /Aborted while waiting for subagent to finish.*parent session shutdown \(reload\)/i,
+    );
   });
 });
 
