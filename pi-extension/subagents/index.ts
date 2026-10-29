@@ -1,7 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -149,6 +149,14 @@ const SubagentParams = Type.Object({
     Type.String({ description: "Appended to system prompt (role instructions)" }),
   ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  contextWindow: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: Number.MAX_SAFE_INTEGER,
+      description:
+        "Usable context budget in tokens before this Pi subagent auto-compacts. Sets the runtime reserve to the model's native context window minus this value, overriding any configured reserve. Must not exceed the native window. Preserves saved settings. Requires Pi 1.4+ and a physical model; not supported for Claude Code agents.",
+    }),
+  ),
   skills: Type.Optional(
     Type.String({ description: "Comma-separated skills (overrides agent default)" }),
   ),
@@ -712,15 +720,15 @@ function updateWidget() {
  * first positional message so that /skill: args land in messages[1..] and arrive
  * as standalone prompts in the child session.
  */
-const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
+const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_report_completion"] as const;
 
 /**
  * Build the child --tools allowlist.
  *
  * Pi 0.70+ applies --tools to built-in, extension, and custom tools. If a
  * subagent definition restricts tools to e.g. "read,bash,write", the child
- * control tools from subagent-done.ts would otherwise be hidden, leaving a
- * manually resumed or user-touched subagent unable to call subagent_done.
+ * control tools from subagent-report-completion.ts would otherwise be hidden, leaving a
+ * manually resumed or user-touched subagent unable to call subagent_report_completion.
  */
 function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
   const requested = (effectiveTools ?? "")
@@ -992,6 +1000,9 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  if (params.contextWindow !== undefined && agentDefs?.cli === "claude") {
+    throw new Error("contextWindow is supported only for Pi-backed subagents, not Claude Code agents.");
+  }
   const effectiveModel = params.model ?? agentDefs?.model;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
@@ -1047,10 +1058,10 @@ async function launchSubagent(
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
   const modeHint = agentDefs?.autoExit
     ? "Complete your task autonomously."
-    : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
+    : "Complete your task. When finished, call the subagent_report_completion tool to report your results to the parent agent. The user can interact with you at any time.";
   const summaryInstruction = agentDefs?.autoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
-    : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
+    : "Your FINAL assistant message (before calling subagent_report_completion or before the user exits) should summarize what you accomplished.";
   const denySet = resolveDenyTools(agentDefs);
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
@@ -1138,8 +1149,12 @@ async function launchSubagent(
   const parts: string[] = ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
 
-  const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-  parts.push("-e", shellEscape(subagentDonePath));
+  const subagentCompletionPath = join(SUBAGENTS_DIR, "subagent-report-completion.ts");
+  parts.push("-e", shellEscape(subagentCompletionPath));
+
+  if (params.contextWindow !== undefined) {
+    parts.push("--subagent-context-window", shellEscape(String(params.contextWindow)));
+  }
 
   if (effectiveModel) {
     const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
@@ -1859,9 +1874,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(params.sessionPath)];
 
-        // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellEscape(subagentDonePath));
+        // Load the completion extension so the agent can report completion if needed
+        const subagentCompletionPath = join(SUBAGENTS_DIR, "subagent-report-completion.ts");
+        parts.push("-e", shellEscape(subagentCompletionPath));
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);

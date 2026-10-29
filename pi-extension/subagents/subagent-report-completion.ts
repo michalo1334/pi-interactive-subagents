@@ -1,10 +1,15 @@
 /**
  * Extension loaded into sub-agents.
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
- * - Provides a `subagent_done` tool for autonomous agents to self-terminate
+ * - Provides a `subagent_report_completion` tool to return results to the parent
+ * - Applies an optional process-local compaction budget
  */
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Box, Text } from "@mariozechner/pi-tui";
+import {
+  SettingsManager,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
@@ -79,6 +84,65 @@ export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;
+  let contextWindow: number | undefined;
+  let activeModel: ExtensionContext["model"];
+  let restoreCompactionSettings: (() => void) | undefined;
+
+  // A CLI flag does not leak into nested spawns, unlike an environment variable.
+  pi.registerFlag("subagent-context-window", {
+    type: "string",
+    description: "Usable context tokens before this subagent auto-compacts",
+  });
+
+  function contextWindowError(): string | undefined {
+    if (contextWindow === undefined || !activeModel) return;
+    if (activeModel.api === "pi-virtual") {
+      return "contextWindow requires a physical model, not a virtual/router model.";
+    }
+    if (!Number.isSafeInteger(activeModel.contextWindow) || contextWindow > activeModel.contextWindow) {
+      return `contextWindow (${contextWindow}) exceeds the model context window (${activeModel.contextWindow}).`;
+    }
+  }
+
+  function failContextWindow(ctx: ExtensionContext, message: string) {
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    if (sessionFile) {
+      try {
+        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "error", errorMessage: message }));
+      } catch {
+        // Still stop the child if the parent notification cannot be written.
+      }
+    }
+    ctx.ui.notify(message, "error");
+    ctx.shutdown();
+  }
+
+  function installContextWindow() {
+    // Pi exposes no extension API to change runtime compaction settings. Scope
+    // this reader shim to the child process and restore it at session shutdown.
+    // Returning a copy keeps global/project settings and model metadata intact.
+    restoreCompactionSettings?.();
+    const original = SettingsManager.prototype.getCompactionSettings;
+    const readSettings: typeof original = function (this: SettingsManager, ...args: Parameters<typeof original>) {
+      const settings = original.apply(this, args);
+      if (contextWindow === undefined || !activeModel) return settings;
+      const error = contextWindowError();
+      if (error) throw new Error(error);
+      return { ...settings, reserveTokens: activeModel.contextWindow - contextWindow };
+    };
+    SettingsManager.prototype.getCompactionSettings = readSettings;
+    restoreCompactionSettings = () => {
+      if (SettingsManager.prototype.getCompactionSettings === readSettings) {
+        SettingsManager.prototype.getCompactionSettings = original;
+      }
+    };
+  }
+
+  pi.on("model_select", (_event, ctx) => {
+    activeModel = ctx.model;
+    const error = contextWindowError();
+    if (error) failContextWindow(ctx, error);
+  });
 
   // Read subagent identity from env vars (set by parent orchestrator)
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
@@ -147,6 +211,23 @@ export default function (pi: ExtensionAPI) {
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
+    activeModel = ctx.model;
+    const rawContextWindow = pi.getFlag("subagent-context-window");
+    if (rawContextWindow !== undefined) {
+      const value = Number(rawContextWindow);
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        failContextWindow(ctx, "--subagent-context-window must be a positive safe integer in tokens.");
+        return;
+      }
+      contextWindow = value;
+      const error = contextWindowError();
+      if (error) {
+        failContextWindow(ctx, error);
+        return;
+      }
+      installContextWindow();
+    }
+
     recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
@@ -256,6 +337,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    restoreCompactionSettings?.();
+    restoreCompactionSettings = undefined;
     recorder.sessionShutdown((event as any).reason);
   });
 
@@ -304,22 +387,22 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "subagent_done",
-    label: "Subagent Done",
+    name: "subagent_report_completion",
+    label: "Report Subagent Completion",
     description:
-      "Call this tool when you have completed your task. " +
-      "It will close this session and return your results to the main session. " +
-      "Your LAST assistant message before calling this becomes the summary returned to the caller.",
+      "Report task completion and return your results to the parent agent. " +
+      "Write an assistant message with your results before calling this tool. " +
+      "That message becomes the summary returned to the parent. This tool closes the subagent session.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      recorder.subagentDone();
+      recorder.reportCompletion();
       if (sessionFile) {
         writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
       }
       ctx.shutdown();
       return {
-        content: [{ type: "text", text: "Shutting down subagent session." }],
+        content: [{ type: "text", text: "Completion reported. Closing subagent session." }],
         details: {},
       };
     },

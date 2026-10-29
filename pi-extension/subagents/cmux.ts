@@ -1227,8 +1227,8 @@ export interface PollResult {
 }
 
 /**
- * Interpret an `.exit` sidecar payload (written by subagent_done / caller_ping /
- * the error path in subagent-done.ts). Centralized so both the fast and slow
+ * Interpret an `.exit` sidecar payload (written by subagent_report_completion / caller_ping /
+ * the error path in subagent-report-completion.ts). Centralized so both the fast and slow
  * paths in pollForExit decode the payload the same way.
  */
 function interpretExitSidecar(data: any): PollResult {
@@ -1268,7 +1268,7 @@ function createPollAbortError(signal: AbortSignal): Error {
 
 /**
  * Poll until the subagent exits. Checks for a `.exit` sidecar file first
- * (written by subagent_done / caller_ping), falling back to the terminal
+ * (written by subagent_report_completion / caller_ping), falling back to the terminal
  * sentinel for crash detection.
  */
 export async function pollForExit(
@@ -1288,7 +1288,7 @@ export async function pollForExit(
       throw createPollAbortError(signal);
     }
 
-    // Fast path: check for .exit sidecar file (written by subagent_done / caller_ping)
+    // Fast path: check for .exit sidecar file (written by subagent_report_completion / caller_ping)
     if (options.sessionFile) {
       try {
         const exitFile = `${options.sessionFile}.exit`;

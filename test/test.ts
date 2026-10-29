@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "nod
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@mariozechner/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -54,7 +54,7 @@ import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
-} from "../pi-extension/subagents/subagent-done.ts";
+} from "../pi-extension/subagents/subagent-report-completion.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
 
 // --- Helpers ---
@@ -1096,7 +1096,7 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,caller_ping,subagent_done",
+      "read,bash,web_search,caller_ping,subagent_report_completion",
     );
   });
 
@@ -1230,7 +1230,7 @@ describe("subagent discovery", () => {
     });
   });
 });
-describe("subagent-done.ts", () => {
+describe("subagent-report-completion.ts", () => {
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);
@@ -1548,7 +1548,7 @@ describe("subagent activity snapshots", () => {
       assert.equal(read.activity.waitingSince, 3_000);
 
       currentNow = 4_000;
-      recorder.subagentDone();
+      recorder.reportCompletion();
       read = readSubagentActivityFile(activityFile, "child-2");
       assert.ok(read.ok);
       assert.equal(read.activity.phase, "done");

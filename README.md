@@ -62,7 +62,7 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 1 subagent-only tool:
+**Subagents** — 4 main-session tools + 3 commands, plus 2 subagent-only tools (`caller_ping` and `subagent_report_completion`):
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
@@ -172,10 +172,33 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
 | `model`                | string  | —              | Override agent's default model                                                                    |
+| `contextWindow`        | integer | —              | Usable context tokens before the Pi child auto-compacts. Overrides the runtime compaction reserve, not the native model window or saved settings. Not supported for Claude Code agents. |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
+
+---
+
+### Context window override
+
+Use `contextWindow` to set the usable context budget for one Pi child process. A physical model is required. Claude Code agents and virtual/router models are not supported.
+
+```typescript
+subagent({ name: "Scout", agent: "scout", contextWindow: 100000, task: "Analyze the codebase..." });
+```
+
+The value must be a positive safe integer in tokens, no larger than the selected model's native context window. It applies to the child's selected model, including later model switches. The child reports an error if a selected model has a smaller window than the requested budget.
+
+Pi starts automatic compaction when `contextTokens > model.contextWindow - compaction.reserveTokens`. This option calculates:
+
+```text
+runtime reserveTokens = model.contextWindow - requested contextWindow
+```
+
+For a model with a 1,048,576-token native window, `contextWindow: 350000` gives a reserve of 698,576 tokens. Compaction then starts above 350,000 tokens. The runtime reserve overrides both ordinary and per-model reserve settings. Automatic compaction must be enabled; `enabled` and `keepRecentTokens` stay unchanged. Keep the budget above `keepRecentTokens`, and leave room in the native window for the model's response. A tool result can overshoot the threshold before Pi checks it, so this is not a hard request-size cap.
+
+The override does not change model metadata, saved settings, the parent, or nested spawns. Omitting it keeps normal Pi compaction behavior. `subagent_resume` uses saved settings rather than this temporary override. The child extension uses a process-local settings reader shim because Pi has no extension API for runtime compaction overrides. It restores the reader on session shutdown, including reload.
 
 ---
 
@@ -197,6 +220,12 @@ This is a turn-level interrupt, not a method for forcibly terminating a subagent
 
 ---
 
+## subagent_report_completion — Return Results to the Parent
+
+When a child finishes its task, it can call `subagent_report_completion({})` to close its session and notify the parent. Write an assistant message with the results before the tool call. The parent receives that message as the completion summary. Agents with `auto-exit: true` can finish without an explicit completion call.
+
+---
+
 ## caller_ping — Child-to-Parent Help Request
 
 The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `subagent_resume`.
@@ -212,7 +241,7 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
-2. Child session exits (like `subagent_done`)
+2. Child session exits (like `subagent_report_completion`)
 3. Parent receives a steer notification: *"Sub-agent Worker needs help: Not sure which schema to use"*
 4. Parent resumes the child session via `subagent_resume` with the response
 5. Child picks up where it left off with the parent's guidance
@@ -301,7 +330,7 @@ You are a specialized agent that does X...
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
-| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_report_completion` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
@@ -331,13 +360,13 @@ session-mode: lineage-only
 
 ### `auto-exit`
 
-When set to `true`, the agent session shuts down automatically as soon as the agent finishes its turn — no explicit `subagent_done` call is needed.
+When set to `true`, the agent session shuts down automatically as soon as the agent finishes its turn — no explicit `subagent_report_completion` call is needed.
 
 **Behavior:**
 
 - The session closes after the agent's final message (on the `agent_end` event)
 - If the user sends **any input** before the agent finishes, auto-exit is permanently disabled for that session — the user takes over interactively
-- The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`
+- The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_report_completion`
 
 **When to use:**
 
@@ -465,7 +494,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 
 ## Requirements
 
-- [pi](https://github.com/badlogic/pi-mono) — the coding agent
+- [pi](https://pi.dev) 1.4.0 or later (`@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui`)
 - One supported multiplexer:
   - [cmux](https://github.com/manaflow-ai/cmux)
   - [tmux](https://github.com/tmux/tmux)
