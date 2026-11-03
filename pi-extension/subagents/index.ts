@@ -32,7 +32,6 @@ import {
 import {
   findLastAssistantMessage,
   getNewEntries,
-  readSessionFileLines,
   seedSubagentSessionFile,
 } from "./session.ts";
 import {
@@ -149,11 +148,8 @@ function getModuleAbortSignal(): AbortSignal {
   return modulePollAbortLifecycle.getSignal();
 }
 
-const SubagentReadSessionParams = Type.Object({
-  id: Type.Optional(Type.String({ description: "Exact id of a currently running subagent" })),
-  sessionPath: Type.Optional(Type.String({ description: "Path to a subagent Pi session .jsonl file" })),
-  offset: Type.Optional(Type.Integer({ minimum: 1, description: "First JSONL line to read (1-based)" })),
-  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500, description: "Maximum lines to return (default 200)" })),
+const SubagentSessionPathParams = Type.Object({
+  id: Type.String({ description: "Exact id of a currently running subagent" }),
 });
 
 const SubagentAnswerQuestionParams = Type.Object({
@@ -271,7 +267,7 @@ const SPAWNING_TOOLS = new Set([
   "subagent",
   "subagent_interrupt",
   "subagent_answer_question",
-  "subagent_read_session",
+  "subagent_session_path",
   "subagents_list",
   "subagent_resume",
 ]);
@@ -1933,60 +1929,35 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // ── subagent_read_session tool ──
-  if (shouldRegister("subagent_read_session"))
+  // ── subagent_session_path tool ──
+  if (shouldRegister("subagent_session_path"))
     pi.registerTool({
-      name: "subagent_read_session",
-      label: "Read Subagent Session",
-      description:
-        "Read raw JSONL entries from a subagent's Pi session file. " +
-        "Use id for a currently running subagent or sessionPath for a completed session. " +
-        "This is for transcript inspection, not completion polling.",
-      promptSnippet:
-        "Read raw JSONL entries from a subagent's Pi session file by running id or session path. " +
-        "Use for transcript inspection, not completion polling.",
-      parameters: SubagentReadSessionParams,
+      name: "subagent_session_path",
+      label: "Subagent Session Path",
+      description: "Return the Pi session/log file path for a currently running subagent.",
+      promptSnippet: "Return the Pi session/log file path for a currently running subagent.",
+      parameters: SubagentSessionPathParams,
 
       async execute(_toolCallId, params) {
-        if (!params.id && !params.sessionPath) {
-          return {
-            content: [{ type: "text", text: "Error: provide id or sessionPath." }],
-            details: { error: "missing target" },
-          };
-        }
-
-        const running = params.id ? runningSubagents.get(params.id) : undefined;
-        if (params.id && !running && !params.sessionPath) {
+        const running = runningSubagents.get(params.id);
+        if (!running) {
           return {
             content: [{ type: "text", text: `Error: no running subagent with id ${params.id}.` }],
             details: { error: "subagent not found", id: params.id },
           };
         }
 
-        const sessionFile = params.sessionPath ?? running!.sessionFile;
-        if (!existsSync(sessionFile)) {
-          return {
-            content: [{ type: "text", text: `Error: session file not found: ${sessionFile}` }],
-            details: { error: "session not found", sessionFile },
-          };
-        }
-
-        const result = readSessionFileLines(sessionFile, params.offset ?? 1, params.limit ?? 200);
-        const range = result.endLine >= result.startLine
-          ? `Lines ${result.startLine}-${result.endLine} of ${result.totalLines}`
-          : `No lines at offset ${result.startLine}; session has ${result.totalLines} lines`;
         return {
-          content: [{ type: "text", text: `${range}\n\n${result.text}`.trimEnd() }],
-          details: { sessionFile, ...result },
+          content: [{ type: "text", text: running.sessionFile }],
+          details: { id: running.id, name: running.name, sessionFile: running.sessionFile },
         };
       },
 
       renderCall(args, theme) {
-        const target = args.id ?? args.sessionPath ?? "subagent session";
         return new Text(
           theme.fg("accent", "▸") + " " +
-            theme.fg("toolTitle", theme.bold(target)) +
-            theme.fg("dim", " — read session"),
+            theme.fg("toolTitle", theme.bold(args.id ?? "subagent")) +
+            theme.fg("dim", " — session path"),
           0,
           0,
         );
@@ -1994,15 +1965,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       renderResult(result, _opts, theme) {
         const details = result.details as any;
-        if (details?.sessionFile) {
-          return new Text(
-            theme.fg("dim", `${details.startLine}-${details.endLine} of ${details.totalLines} lines`),
-            0,
-            0,
-          );
-        }
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
-        return new Text(theme.fg("dim", text), 0, 0);
+        const text = details?.sessionFile ?? result.content[0]?.text ?? "";
+        return new Text(theme.fg("dim", String(text)), 0, 0);
       },
     });
 

@@ -69,7 +69,7 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 | `subagent`           | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)             |
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
 | `subagent_answer_question` | Answer a running child's `ask_user_question` call without closing its pane            |
-| `subagent_read_session` | Read raw JSONL entries from a running or completed subagent session                    |
+| `subagent_session_path` | Return the Pi session/log file path for a running subagent                              |
 | `subagents_list`     | List available agent definitions                                                            |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
 

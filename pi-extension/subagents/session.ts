@@ -92,24 +92,6 @@ export function getNewEntries(sessionFile: string, afterLine: number): SessionEn
   return lines.slice(afterLine).map((line) => JSON.parse(line) as SessionEntry);
 }
 
-export function readSessionFileLines(
-  sessionFile: string,
-  offset = 1,
-  limit = 200,
-): { text: string; totalLines: number; startLine: number; endLine: number } {
-  const lines = readFileSync(sessionFile, "utf8")
-    .split("\n")
-    .filter((line) => line.trim());
-  const startLine = Math.max(1, offset);
-  const selected = lines.slice(startLine - 1, startLine - 1 + Math.max(1, limit));
-  return {
-    text: selected.join("\n"),
-    totalLines: lines.length,
-    startLine,
-    endLine: selected.length > 0 ? startLine + selected.length - 1 : startLine - 1,
-  };
-}
-
 /**
  * Find the last assistant message text in a list of entries.
  *

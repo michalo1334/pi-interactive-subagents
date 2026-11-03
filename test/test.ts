@@ -14,7 +14,6 @@ import {
   appendBranchSummary,
   copySessionFile,
   mergeNewEntries,
-  readSessionFileLines,
   seedSubagentSessionFile,
 } from "../pi-extension/subagents/session.ts";
 
@@ -305,18 +304,6 @@ describe("session.ts", () => {
       const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE]);
       const entries = getNewEntries(file, 2);
       assert.equal(entries.length, 0);
-    });
-  });
-
-  describe("readSessionFileLines", () => {
-    it("reads a bounded 1-based JSONL range", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
-      assert.deepEqual(readSessionFileLines(file, 2, 2), {
-        text: [MODEL_CHANGE, USER_MSG].map((entry) => JSON.stringify(entry)).join("\n"),
-        totalLines: 4,
-        startLine: 2,
-        endLine: 3,
-      });
     });
   });
 
@@ -1740,7 +1727,7 @@ describe("tool registration", () => {
     assert.equal(denied.has("subagent"), true);
     assert.equal(denied.has("subagent_interrupt"), true);
     assert.equal(denied.has("subagent_answer_question"), true);
-    assert.equal(denied.has("subagent_read_session"), true);
+    assert.equal(denied.has("subagent_session_path"), true);
     assert.equal(denied.has("subagent_resume"), true);
   });
 
@@ -1826,25 +1813,25 @@ describe("tool registration", () => {
     }
   });
 
-  it("reads a subagent session by path", async () => {
-    const dir = createTestDir();
-    const sessionFile = createSessionFile(dir, [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]);
+  it("returns a running subagent session path", async () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
-    const readTool = registeredTools.find((tool) => tool.name === "subagent_read_session");
-    assert.ok(readTool, "expected subagent_read_session tool");
+    const pathTool = registeredTools.find((tool) => tool.name === "subagent_session_path");
+    assert.ok(pathTool, "expected subagent_session_path tool");
+
+    const running = (subagentsModule as any).__test__.runningSubagents;
+    running.set("child-1", {
+      id: "child-1",
+      name: "Worker",
+      sessionFile: "/tmp/child-1.jsonl",
+    });
 
     try {
-      const result = await readTool.execute("read-call", {
-        sessionPath: sessionFile,
-        offset: 2,
-        limit: 1,
-      });
-      assert.match(result.content[0].text, /Lines 2-2 of 3/);
-      assert.match(result.content[0].text, /"role":"user"/);
-      assert.equal(result.details.sessionFile, sessionFile);
+      const result = await pathTool.execute("path-call", { id: "child-1" });
+      assert.equal(result.content[0].text, "/tmp/child-1.jsonl");
+      assert.equal(result.details.sessionFile, "/tmp/child-1.jsonl");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      running.delete("child-1");
     }
   });
 
