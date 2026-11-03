@@ -62,12 +62,14 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 2 subagent-only tools (`caller_ping` and `subagent_report_completion`):
+**Subagents** — 6 main-session tools + 3 commands, plus 2 subagent-only tools (`caller_ping` and `subagent_report_completion`):
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)             |
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
+| `subagent_answer_question` | Answer a running child's `ask_user_question` call without closing its pane            |
+| `subagent_read_session` | Read raw JSONL entries from a running or completed subagent session                    |
 | `subagents_list`     | List available agent definitions                                                            |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
 
@@ -171,6 +173,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
+| `naturalPrompt`        | boolean | `false`        | Send `task` as the exact initial user message, without task wrappers or `@file` delivery.          |
 | `model`                | string  | —              | Override agent's default model                                                                    |
 | `contextWindow`        | integer | —              | Usable context tokens before the Pi child auto-compacts. Overrides the runtime compaction reserve, not the native model window or saved settings. Not supported for Claude Code agents. |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
@@ -223,6 +226,51 @@ This is a turn-level interrupt, not a method for forcibly terminating a subagent
 ## subagent_report_completion — Return Results to the Parent
 
 When a child finishes its task, it can call `subagent_report_completion({})` to close its session and notify the parent. Write an assistant message with the results before the tool call. The parent receives that message as the completion summary. Agents with `auto-exit: true` can finish without an explicit completion call.
+
+---
+
+## Simulated User Questions
+
+Managed Pi subagents intercept `ask_user_question` calls for automated skill and conversation tests. The original question extension still owns the tool and its structured schema, but the child-side interceptor routes the call before the real user interface opens.
+
+When a child calls `ask_user_question`:
+
+1. The child keeps its pane and original tool call open, then publishes the structured questions through a sidecar bridge.
+2. The parent watcher wakes the parent agent with the questions and exact request identifiers.
+3. The parent calls `subagent_answer_question` with structured option indexes or custom text.
+4. The child forwards that answer into the question extension's public external-answer channel.
+5. The original tool call returns its native canonical envelope, such as `User has answered your questions: "<question>"="<answer>". You can now continue with the user's answers in mind.` The child continues in the same turn and pane.
+6. The parent UI shows an ephemeral notification of exactly what the parent answered; that notification is not delivered to the child.
+
+The interceptor activates only when `PI_SUBAGENT_ID` identifies a managed child session. It does not affect `ask_user_question` in the main Pi session.
+
+Control the feature from the parent session:
+
+```text
+/subagent-simulated-user on
+/subagent-simulated-user off
+/subagent-simulated-user status
+```
+
+The setting defaults to `on`, persists in the current Pi session, and applies to future subagent launches and resumes. Turning it off disables interception, so the child's normal `ask_user_question` behavior remains in effect.
+
+This flow is useful for testing skills that ask clarifying questions, onboarding scripts, interview styles, and conversational tone without stopping for human input.
+
+```typescript
+// Inside a managed subagent or a skill under test
+await ask_user_question({
+  questions: [{
+    header: "Tone",
+    question: "Which tone should the reply use?",
+    options: [
+      { label: "Direct", description: "Short and explicit." },
+      { label: "Warm", description: "Friendly and supportive." },
+    ],
+  }],
+});
+```
+
+The bridge uses `@juicesharp/rpiv-ask-user-question`'s public `rpiv:ask-user:*` event contract, so it does not replace or duplicate the question tool. The cross-process handoff uses JSON sidecars because the parent and child event buses are process-local. Ordinary `subagent_resume` prompts are still passed as direct text rather than `@file` attachments, avoiding `<file ...>` wrappers.
 
 ---
 

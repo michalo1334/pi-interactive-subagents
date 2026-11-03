@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,7 @@ import {
   appendBranchSummary,
   copySessionFile,
   mergeNewEntries,
+  readSessionFileLines,
   seedSubagentSessionFile,
 } from "../pi-extension/subagents/session.ts";
 
@@ -50,12 +51,27 @@ import {
   getSubagentActivityFile,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
-import {
+import subagentDoneExtension, {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-report-completion.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
+import {
+  ASK_USER_ANSWER_EVENT,
+  ASK_USER_ANSWER_RESULT_EVENT,
+  ASK_USER_PROMPT_EVENT,
+  createSimulatedUserQuestionRequest,
+  formatSimulatedUserAnswerNotification,
+  formatSimulatedUserQuestionPrompt,
+  getSimulatedUserAnswerPath,
+  getSimulatedUserAnswerResultPath,
+  getSimulatedUserQuestionPath,
+  readSimulatedUserAnswer,
+  readSimulatedUserAnswerResult,
+  readSimulatedUserQuestionRequest,
+  writeJsonAtomic,
+} from "../pi-extension/subagents/simulated-user.ts";
 
 // --- Helpers ---
 
@@ -86,6 +102,9 @@ function createMockExtensionApi() {
   const registeredHandlers: Array<{ event: string; handler: any }> = [];
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
+  const appendedEntries: Array<{ customType: string; data: any }> = [];
+  const extensionEventHandlers = new Map<string, Array<(payload: any) => void>>();
+  const emittedExtensionEvents: Array<{ event: string; payload: any }> = [];
   return {
     registeredTools,
     registeredCommands,
@@ -93,6 +112,9 @@ function createMockExtensionApi() {
     registeredHandlers,
     sentUserMessages,
     sentMessages,
+    appendedEntries,
+    extensionEventHandlers,
+    emittedExtensionEvents,
     api: {
       on(event: string, handler: any) {
         registeredHandlers.push({ event, handler });
@@ -113,8 +135,22 @@ function createMockExtensionApi() {
       sendMessage(message: any, options?: any) {
         sentMessages.push({ message, options });
       },
+      appendEntry(customType: string, data: any) {
+        appendedEntries.push({ customType, data });
+      },
       getAllTools() {
         return [];
+      },
+      events: {
+        on(event: string, handler: (payload: any) => void) {
+          const handlers = extensionEventHandlers.get(event) ?? [];
+          handlers.push(handler);
+          extensionEventHandlers.set(event, handlers);
+        },
+        emit(event: string, payload: any) {
+          emittedExtensionEvents.push({ event, payload });
+          for (const handler of extensionEventHandlers.get(event) ?? []) handler(payload);
+        },
       },
     } as any,
   };
@@ -126,6 +162,15 @@ function restoreEnvVar(name: string, value: string | undefined) {
     return;
   }
   process.env[name] = value;
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for condition");
 }
 
 function withMockedNow<T>(now: number, fn: () => T): T {
@@ -260,6 +305,18 @@ describe("session.ts", () => {
       const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE]);
       const entries = getNewEntries(file, 2);
       assert.equal(entries.length, 0);
+    });
+  });
+
+  describe("readSessionFileLines", () => {
+    it("reads a bounded 1-based JSONL range", () => {
+      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      assert.deepEqual(readSessionFileLines(file, 2, 2), {
+        text: [MODEL_CHANGE, USER_MSG].map((entry) => JSON.stringify(entry)).join("\n"),
+        totalLines: 4,
+        startLine: 2,
+        endLine: 3,
+      });
     });
   });
 
@@ -1091,12 +1148,27 @@ describe("subagent discovery", () => {
         taskDelivery: "direct",
       },
     );
+    assert.deepEqual(
+      testApi.resolveLaunchBehavior(
+        { name: "A", task: "T", naturalPrompt: true },
+        null,
+      ),
+      {
+        sessionMode: "standalone",
+        seededSessionMode: null,
+        inheritsConversationContext: false,
+        taskDelivery: "direct",
+      },
+    );
   });
 
+  // SIMULATED-USER-01 (Unit)
+  // WHEN a child agent restricts its tool allowlist,
+  // THE launcher SHALL preserve the routed question tool with the other child controls.
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,caller_ping,subagent_report_completion",
+      "read,bash,web_search,caller_ping,subagent_report_completion,ask_user_question",
     );
   });
 
@@ -1266,6 +1338,174 @@ describe("subagent-report-completion.ts", () => {
     });
   });
 
+  describe("routed ask_user_question", () => {
+    it("registers the live bridge only in enabled managed subagents", () => {
+      const previousId = process.env.PI_SUBAGENT_ID;
+      const previousSession = process.env.PI_SUBAGENT_SESSION;
+      const previousSetting = process.env.PI_SUBAGENT_SIMULATED_USER;
+
+      try {
+        delete process.env.PI_SUBAGENT_ID;
+        delete process.env.PI_SUBAGENT_SESSION;
+        delete process.env.PI_SUBAGENT_SIMULATED_USER;
+        const standalone = createMockExtensionApi();
+        subagentDoneExtension(standalone.api);
+        assert.equal(standalone.extensionEventHandlers.has(ASK_USER_PROMPT_EVENT), false);
+        assert.equal(standalone.registeredTools.some((tool) => tool.name === "ask_user_question"), false);
+
+        process.env.PI_SUBAGENT_ID = "child-123";
+        process.env.PI_SUBAGENT_SESSION = "/tmp/child-123.jsonl";
+        const child = createMockExtensionApi();
+        subagentDoneExtension(child.api);
+        assert.equal(child.extensionEventHandlers.has(ASK_USER_PROMPT_EVENT), true);
+        assert.equal(child.registeredTools.some((tool) => tool.name === "ask_user_question"), false);
+
+        process.env.PI_SUBAGENT_SIMULATED_USER = "0";
+        const disabled = createMockExtensionApi();
+        subagentDoneExtension(disabled.api);
+        assert.equal(disabled.extensionEventHandlers.has(ASK_USER_PROMPT_EVENT), false);
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_ID", previousId);
+        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+        restoreEnvVar("PI_SUBAGENT_SIMULATED_USER", previousSetting);
+      }
+    });
+
+    it("keeps the child alive and answers the original question tool", async () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "child.jsonl");
+      const previousId = process.env.PI_SUBAGENT_ID;
+      const previousName = process.env.PI_SUBAGENT_NAME;
+      const previousSession = process.env.PI_SUBAGENT_SESSION;
+      let child: ReturnType<typeof createMockExtensionApi> | null = null;
+
+      try {
+        process.env.PI_SUBAGENT_ID = "child-456";
+        process.env.PI_SUBAGENT_NAME = "Tone Tester";
+        process.env.PI_SUBAGENT_SESSION = sessionFile;
+
+        child = createMockExtensionApi();
+        subagentDoneExtension(child.api);
+        child.api.events.on(ASK_USER_ANSWER_EVENT, (answer: any) => {
+          child.api.events.emit(ASK_USER_ANSWER_RESULT_EVENT, {
+            ok: true,
+            requestId: answer.requestId,
+            toolCallId: answer.toolCallId,
+          });
+        });
+
+        for (const registration of child.registeredHandlers.filter(
+          (handler) => handler.event === "tool_call",
+        )) {
+          const result = await registration.handler({
+            toolName: "ask_user_question",
+            toolCallId: "tool-call-1",
+            input: {
+              questions: [{
+                header: "Tone",
+                question: "Which tone should the reply use?",
+                options: [
+                  { label: "Direct", description: "Short and explicit.", preview: "DIRECT" },
+                  { label: "Warm", description: "Friendly and supportive." },
+                ],
+              }],
+            },
+          });
+          assert.equal(result, undefined, "the original tool call must not be blocked");
+        }
+
+        child.api.events.emit(ASK_USER_PROMPT_EVENT, {
+          toolCallId: "tool-call-1",
+          questions: [{
+            header: "Tone",
+            question: "Which tone should the reply use?",
+            multiSelect: false,
+            options: [
+              { label: "Direct", description: "Short and explicit.", hasPreview: true },
+              { label: "Warm", description: "Friendly and supportive.", hasPreview: false },
+            ],
+          }],
+        });
+
+        const request = JSON.parse(readFileSync(getSimulatedUserQuestionPath(sessionFile), "utf8"));
+        assert.equal(request.name, "Tone Tester");
+        assert.equal(request.toolCallId, "tool-call-1");
+        assert.equal(request.questions[0].options[0].preview, "DIRECT");
+        assert.equal(existsSync(`${sessionFile}.exit`), false);
+
+        writeFileSync(getSimulatedUserAnswerPath(sessionFile), JSON.stringify({
+          version: 1,
+          requestId: request.requestId,
+          toolCallId: request.toolCallId,
+          answers: [{ questionIndex: 0, optionIndexes: [1] }],
+        }));
+
+        await waitFor(() => child.emittedExtensionEvents.some(
+          (event) => event.event === ASK_USER_ANSWER_EVENT,
+        ));
+        await waitFor(() => existsSync(getSimulatedUserAnswerResultPath(sessionFile)));
+        const result = JSON.parse(readFileSync(getSimulatedUserAnswerResultPath(sessionFile), "utf8"));
+        assert.equal(result.ok, true);
+        assert.equal(existsSync(getSimulatedUserQuestionPath(sessionFile)), false);
+      } finally {
+        for (const registration of child?.registeredHandlers.filter(
+          (handler) => handler.event === "session_shutdown",
+        ) ?? []) {
+          registration.handler({ reason: "test cleanup" });
+        }
+        restoreEnvVar("PI_SUBAGENT_ID", previousId);
+        restoreEnvVar("PI_SUBAGENT_NAME", previousName);
+        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("simulated-user answer formatting", () => {
+    it("formats the parent-only notification with canonical answer text", () => {
+      const request = createSimulatedUserQuestionRequest({
+        toolCallId: "call-1",
+        name: "Tone Tester",
+        questions: [{
+          header: "Hidden detail",
+          question: "What should I avoid telling the relaunched subagent?",
+          options: [
+            { label: "Do not mention test (Recommended)", description: "Keep the test hidden." },
+            { label: "Mention test", description: "Be explicit." },
+          ],
+        }],
+      });
+      assert.equal(
+        formatSimulatedUserAnswerNotification(request, {
+          version: 1,
+          requestId: request.requestId,
+          toolCallId: request.toolCallId,
+          answers: [{ questionIndex: 0, optionIndexes: [0] }],
+        }),
+        'User has answered your questions: "What should I avoid telling the relaunched subagent?"="Do not mention test (Recommended)". You can now continue with the user\'s answers in mind.',
+      );
+    });
+
+    it("tells the parent to answer the live request without resuming", () => {
+      const request = createSimulatedUserQuestionRequest({
+        toolCallId: "call-1",
+        name: "Tone Tester",
+        questions: [{
+          header: "Tone",
+          question: "Which tone?",
+          options: [
+            { label: "Direct", description: "Short." },
+            { label: "Warm", description: "Friendly." },
+          ],
+        }],
+      });
+      const prompt = formatSimulatedUserQuestionPrompt(request, "child-1");
+      assert.match(prompt, /subagent_answer_question/);
+      assert.match(prompt, /pane remains open/i);
+      assert.doesNotMatch(prompt, /subagent_resume/);
+    });
+  });
+
   describe("findLatestAssistantError", () => {
     it("returns the error info from a stopReason=error message", () => {
       const messages = [
@@ -1413,6 +1653,56 @@ describe("cmux.ts interpretExitSidecar", () => {
   });
 });
 describe("commands", () => {
+  // SIMULATED-USER-04 (Unit)
+  // WHEN the user disables simulated questions with the slash command,
+  // THE extension SHALL persist the setting for the current session and report the new state.
+  it("/subagent-simulated-user toggles and reports the setting", async () => {
+    const { api, registeredCommands, registeredHandlers, appendedEntries } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const sessionStart = registeredHandlers.find((handler) => handler.event === "session_start");
+    assert.ok(sessionStart, "expected session_start handler");
+    sessionStart.handler({}, {
+      sessionManager: {
+        getBranch() {
+          return [{
+            type: "custom",
+            customType: "subagent-simulated-user-setting",
+            data: { enabled: false },
+          }];
+        },
+      },
+    });
+
+    const command = registeredCommands.find(
+      (candidate) => candidate.name === "subagent-simulated-user",
+    );
+    assert.ok(command, "expected /subagent-simulated-user command");
+
+    const notifications: string[] = [];
+    const ctx = { ui: { notify(message: string) { notifications.push(message); } } };
+
+    await command.handler("status", ctx);
+    assert.match(notifications.at(-1) ?? "", /disabled/i);
+
+    await command.handler("off", ctx);
+    assert.deepEqual(appendedEntries.at(-1), {
+      customType: "subagent-simulated-user-setting",
+      data: { enabled: false },
+    });
+    assert.match(notifications.at(-1) ?? "", /disabled/i);
+
+    await command.handler("status", ctx);
+    assert.match(notifications.at(-1) ?? "", /disabled/i);
+
+    await command.handler("on", ctx);
+    assert.deepEqual(appendedEntries.at(-1), {
+      customType: "subagent-simulated-user-setting",
+      data: { enabled: true },
+    });
+    assert.match(notifications.at(-1) ?? "", /enabled/i);
+  });
+
   it("/iterate always emits a full-context fork tool call", () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
 
@@ -1449,6 +1739,8 @@ describe("tool registration", () => {
 
     assert.equal(denied.has("subagent"), true);
     assert.equal(denied.has("subagent_interrupt"), true);
+    assert.equal(denied.has("subagent_answer_question"), true);
+    assert.equal(denied.has("subagent_read_session"), true);
     assert.equal(denied.has("subagent_resume"), true);
   });
 
@@ -1471,6 +1763,89 @@ describe("tool registration", () => {
     const output = rendered.render(80).join("\n");
 
     assert.match(output, /\(unnamed\)/);
+  });
+
+  it("answers a running child's live question and shows a parent-only notification", async () => {
+    const dir = createTestDir();
+    const sessionFile = join(dir, "child.jsonl");
+    writeFileSync(sessionFile, "");
+    const request = createSimulatedUserQuestionRequest({
+      toolCallId: "call-1",
+      name: "Tone Tester",
+      questions: [{
+        header: "Tone",
+        question: "Which tone?",
+        options: [
+          { label: "Direct", description: "Short." },
+          { label: "Warm", description: "Friendly." },
+        ],
+      }],
+    });
+    writeFileSync(getSimulatedUserQuestionPath(sessionFile), JSON.stringify(request));
+
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const answerTool = registeredTools.find((tool) => tool.name === "subagent_answer_question");
+    assert.ok(answerTool, "expected subagent_answer_question tool");
+
+    const running = (subagentsModule as any).__test__.runningSubagents;
+    running.set("child-1", { id: "child-1", name: "Tone Tester", sessionFile });
+    const notifications: string[] = [];
+
+    const verdictTimer = setInterval(() => {
+      const answer = readSimulatedUserAnswer(sessionFile);
+      if (!answer) return;
+      clearInterval(verdictTimer);
+      writeFileSync(getSimulatedUserAnswerResultPath(sessionFile), JSON.stringify({
+        ok: true,
+        requestId: answer.requestId,
+        toolCallId: answer.toolCallId,
+      }));
+    }, 10);
+
+    try {
+      const result = await answerTool.execute(
+        "parent-call-1",
+        {
+          id: "child-1",
+          requestId: request.requestId,
+          answers: [{ questionIndex: 0, optionIndexes: [1] }],
+        },
+        new AbortController().signal,
+        undefined,
+        { ui: { notify(message: string) { notifications.push(message); } } },
+      );
+
+      assert.equal(result.details.accepted, true);
+      assert.match(notifications[0], /"Which tone\?"="Warm"/);
+      assert.equal(readSimulatedUserAnswer(sessionFile)?.answers?.[0].optionIndexes?.[0], 1);
+    } finally {
+      clearInterval(verdictTimer);
+      running.delete("child-1");
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reads a subagent session by path", async () => {
+    const dir = createTestDir();
+    const sessionFile = createSessionFile(dir, [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]);
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const readTool = registeredTools.find((tool) => tool.name === "subagent_read_session");
+    assert.ok(readTool, "expected subagent_read_session tool");
+
+    try {
+      const result = await readTool.execute("read-call", {
+        sessionPath: sessionFile,
+        offset: 2,
+        limit: 1,
+      });
+      assert.match(result.content[0].text, /Lines 2-2 of 3/);
+      assert.match(result.content[0].text, /"role":"user"/);
+      assert.equal(result.details.sessionFile, sessionFile);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("registers subagent_resume with an autoExit override", () => {

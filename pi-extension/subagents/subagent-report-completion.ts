@@ -13,6 +13,21 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import {
+  ASK_USER_ANSWER_EVENT,
+  ASK_USER_ANSWER_RESULT_EVENT,
+  ASK_USER_BLOCKED_EVENT,
+  ASK_USER_PROMPT_EVENT,
+  createSimulatedUserQuestionRequest,
+  getSimulatedUserAnswerPath,
+  getSimulatedUserAnswerResultPath,
+  getSimulatedUserQuestionPath,
+  readSimulatedUserAnswer,
+  removeSimulatedUserFile,
+  writeJsonAtomic,
+  type SimulatedUserQuestion,
+  type SimulatedUserQuestionRequest,
+} from "./simulated-user.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -150,10 +165,20 @@ export default function (pi: ExtensionAPI) {
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
   const isSubagent = Boolean(process.env.PI_SUBAGENT_ID);
+  const simulatedUserQuestionsEnabled = process.env.PI_SUBAGENT_SIMULATED_USER !== "0";
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
+  const capturedQuestionInputs = new Map<string, SimulatedUserQuestion[]>();
+  let pendingQuestion: SimulatedUserQuestionRequest | null = null;
+  let answerInterval: ReturnType<typeof setInterval> | null = null;
+
+  function stopAnswerInterval() {
+    if (!answerInterval) return;
+    clearInterval(answerInterval);
+    answerInterval = null;
+  }
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
     ctx.ui.setWidget(
@@ -322,7 +347,107 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_call", (event) => {
     recorder.toolCall((event as any).toolCallId, (event as any).toolName);
+
+    if (
+      isSubagent &&
+      simulatedUserQuestionsEnabled &&
+      (event as any).toolName === "ask_user_question"
+    ) {
+      capturedQuestionInputs.set(
+        (event as any).toolCallId,
+        (((event as any).input?.questions ?? []) as SimulatedUserQuestion[]),
+      );
+    }
   });
+
+  if (isSubagent && simulatedUserQuestionsEnabled) {
+    const events = (pi as any).events;
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+
+    if (events && sessionFile) {
+      events.on(ASK_USER_PROMPT_EVENT, (payload: any) => {
+        const toolCallId = typeof payload?.toolCallId === "string" ? payload.toolCallId : "";
+        if (!toolCallId || !Array.isArray(payload?.questions)) return;
+
+        const authored = capturedQuestionInputs.get(toolCallId) ?? [];
+        const questions: SimulatedUserQuestion[] = payload.questions.map(
+          (question: SimulatedUserQuestion, questionIndex: number) => ({
+            ...question,
+            options: question.options.map((option, optionIndex) => ({
+              ...option,
+              ...(authored[questionIndex]?.options[optionIndex]?.preview
+                ? { preview: authored[questionIndex]!.options[optionIndex]!.preview }
+                : {}),
+            })),
+          }),
+        );
+
+        pendingQuestion = createSimulatedUserQuestionRequest({
+          toolCallId,
+          name: process.env.PI_SUBAGENT_NAME ?? "subagent",
+          questions,
+        });
+        removeSimulatedUserFile(getSimulatedUserAnswerPath(sessionFile));
+        removeSimulatedUserFile(getSimulatedUserAnswerResultPath(sessionFile));
+        writeJsonAtomic(getSimulatedUserQuestionPath(sessionFile), pendingQuestion);
+
+        stopAnswerInterval();
+        answerInterval = setInterval(() => {
+          if (!pendingQuestion) return;
+          const answer = readSimulatedUserAnswer(sessionFile);
+          if (
+            !answer ||
+            answer.requestId !== pendingQuestion.requestId ||
+            answer.toolCallId !== pendingQuestion.toolCallId
+          ) {
+            return;
+          }
+
+          removeSimulatedUserFile(getSimulatedUserAnswerPath(sessionFile));
+          events.emit(ASK_USER_ANSWER_EVENT, {
+            toolCallId: answer.toolCallId,
+            requestId: answer.requestId,
+            ...(answer.answers ? { answers: answer.answers } : {}),
+            ...(answer.globalNote !== undefined ? { globalNote: answer.globalNote } : {}),
+            ...(answer.cancel !== undefined ? { cancel: answer.cancel } : {}),
+          });
+        }, 100);
+      });
+
+      events.on(ASK_USER_ANSWER_RESULT_EVENT, (result: any) => {
+        if (!pendingQuestion || result?.requestId !== pendingQuestion.requestId) return;
+        writeJsonAtomic(getSimulatedUserAnswerResultPath(sessionFile), result);
+        if (!result.ok) return;
+
+        capturedQuestionInputs.delete(pendingQuestion.toolCallId);
+        removeSimulatedUserFile(getSimulatedUserQuestionPath(sessionFile));
+        pendingQuestion = null;
+        stopAnswerInterval();
+      });
+
+      events.on(ASK_USER_BLOCKED_EVENT, (payload: any) => {
+        if (
+          payload?.active !== false ||
+          !pendingQuestion ||
+          payload?.toolCallId !== pendingQuestion.toolCallId
+        ) {
+          return;
+        }
+
+        writeJsonAtomic(getSimulatedUserAnswerResultPath(sessionFile), {
+          ok: false,
+          requestId: pendingQuestion.requestId,
+          toolCallId: pendingQuestion.toolCallId,
+          code: "not_found",
+          reason: "The questionnaire closed before the simulated answer was accepted.",
+        });
+        capturedQuestionInputs.delete(pendingQuestion.toolCallId);
+        removeSimulatedUserFile(getSimulatedUserQuestionPath(sessionFile));
+        pendingQuestion = null;
+        stopAnswerInterval();
+      });
+    }
+  }
 
   pi.on("tool_execution_update", (event) => {
     recorder.toolExecutionUpdate((event as any).toolCallId, (event as any).toolName);
@@ -337,6 +462,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    stopAnswerInterval();
     restoreCompactionSettings?.();
     restoreCompactionSettings = undefined;
     recorder.sessionShutdown((event as any).reason);

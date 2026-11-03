@@ -32,6 +32,7 @@ import {
 import {
   findLastAssistantMessage,
   getNewEntries,
+  readSessionFileLines,
   seedSubagentSessionFile,
 } from "./session.ts";
 import {
@@ -53,6 +54,18 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
+import {
+  formatSimulatedUserAnswerNotification,
+  formatSimulatedUserQuestionPrompt,
+  getSimulatedUserAnswerPath,
+  getSimulatedUserAnswerResultPath,
+  readSimulatedUserAnswerResult,
+  readSimulatedUserQuestionRequest,
+  removeSimulatedUserFile,
+  writeJsonAtomic,
+  type SimulatedUserAnswer,
+  type SimulatedUserQuestionRequest,
+} from "./simulated-user.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -136,6 +149,33 @@ function getModuleAbortSignal(): AbortSignal {
   return modulePollAbortLifecycle.getSignal();
 }
 
+const SubagentReadSessionParams = Type.Object({
+  id: Type.Optional(Type.String({ description: "Exact id of a currently running subagent" })),
+  sessionPath: Type.Optional(Type.String({ description: "Path to a subagent Pi session .jsonl file" })),
+  offset: Type.Optional(Type.Integer({ minimum: 1, description: "First JSONL line to read (1-based)" })),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500, description: "Maximum lines to return (default 200)" })),
+});
+
+const SubagentAnswerQuestionParams = Type.Object({
+  id: Type.String({ description: "Exact running subagent id from the question notification" }),
+  requestId: Type.String({ description: "Exact request id from the question notification" }),
+  answers: Type.Optional(
+    Type.Array(
+      Type.Object({
+        questionIndex: Type.Integer({ description: "0-based question index" }),
+        optionIndexes: Type.Optional(
+          Type.Array(Type.Integer({ description: "0-based option index" })),
+        ),
+        text: Type.Optional(Type.String({ description: "Custom answer text" })),
+        notes: Type.Optional(Type.String({ description: "Optional note for this question" })),
+      }),
+      { description: "One answer entry per question" },
+    ),
+  ),
+  globalNote: Type.Optional(Type.String({ description: "Optional note for the whole questionnaire" })),
+  cancel: Type.Optional(Type.Boolean({ description: "Decline the questionnaire" })),
+});
+
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
   task: Type.String({ description: "Task/prompt for the sub-agent" }),
@@ -181,6 +221,12 @@ const SubagentParams = Type.Object({
         "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
     }),
   ),
+  naturalPrompt: Type.Optional(
+    Type.Boolean({
+      description:
+        "Send task as the exact initial user message, without autonomous-task wrappers or @file delivery. Use for natural conversation tests.",
+    }),
+  ),
   resumeSessionId: Type.Optional(
     Type.String({
       description:
@@ -224,6 +270,8 @@ interface ListedAgentDefinition extends AgentDefinition {
 const SPAWNING_TOOLS = new Set([
   "subagent",
   "subagent_interrupt",
+  "subagent_answer_question",
+  "subagent_read_session",
   "subagents_list",
   "subagent_resume",
 ]);
@@ -387,7 +435,7 @@ function resolveLaunchBehavior(
     sessionMode,
     seededSessionMode: sessionMode === "standalone" ? null : sessionMode,
     inheritsConversationContext,
-    taskDelivery: inheritsConversationContext ? "direct" : "artifact",
+    taskDelivery: inheritsConversationContext || params.naturalPrompt ? "direct" : "artifact",
   };
 }
 
@@ -566,6 +614,7 @@ interface RunningSubagent {
   cli?: string;
   sentinelFile?: string;
   statusState: SubagentStatusState;
+  lastQuestionRequestId?: string;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
    * session via a steer message. The widget still updates locally. Used for
@@ -720,7 +769,22 @@ function updateWidget() {
  * first positional message so that /skill: args land in messages[1..] and arrive
  * as standalone prompts in the child session.
  */
-const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_report_completion"] as const;
+const SUBAGENT_CONTROL_TOOLS = [
+  "caller_ping",
+  "subagent_report_completion",
+  "ask_user_question",
+] as const;
+const SIMULATED_USER_SETTING_ENTRY = "subagent-simulated-user-setting";
+
+function restoreSimulatedUserQuestionsSetting(ctx: ExtensionContext): boolean {
+  let enabled = true;
+  for (const entry of ctx.sessionManager.getBranch()) {
+    if (entry.type !== "custom" || entry.customType !== SIMULATED_USER_SETTING_ENTRY) continue;
+    const value = (entry.data as { enabled?: unknown } | undefined)?.enabled;
+    if (typeof value === "boolean") enabled = value;
+  }
+  return enabled;
+}
 
 /**
  * Build the child --tools allowlist.
@@ -994,7 +1058,7 @@ function startWidgetRefresh() {
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
-  options?: { surface?: string },
+  options?: { surface?: string; simulatedUserQuestionsEnabled?: boolean },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -1067,7 +1131,7 @@ async function launchSubagent(
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
-  const fullTask = inheritsConversationContext
+  const fullTask = params.naturalPrompt || inheritsConversationContext
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
   // ── Claude Code CLI path ──
@@ -1207,6 +1271,7 @@ async function launchSubagent(
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+  envParts.push(`PI_SUBAGENT_SIMULATED_USER=${options?.simulatedUserQuestionsEnabled === false ? "0" : "1"}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
@@ -1311,9 +1376,48 @@ function copyClaudeSession(sentinelFile: string): string | null {
   }
 }
 
+function notifySimulatedUserQuestion(
+  pi: ExtensionAPI,
+  running: RunningSubagent,
+  request: SimulatedUserQuestionRequest,
+): void {
+  const content = formatSimulatedUserQuestionPrompt(request, running.id);
+  pi.sendMessage(
+    {
+      customType: "subagent_question",
+      content,
+      display: true,
+      details: {
+        id: running.id,
+        name: running.name,
+        requestId: request.requestId,
+        questions: request.questions,
+      },
+    },
+    { triggerTurn: true, deliverAs: "steer" },
+  );
+}
+
+async function waitForSimulatedUserAnswerResult(
+  sessionFile: string,
+  requestId: string,
+  signal?: AbortSignal,
+  timeoutMs = 5000,
+): Promise<ReturnType<typeof readSimulatedUserAnswerResult>> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (signal?.aborted) return null;
+    const result = readSimulatedUserAnswerResult(sessionFile);
+    if (result?.requestId === requestId) return result;
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  }
+  return null;
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
+  hooks?: { onQuestion?: (request: SimulatedUserQuestionRequest) => void },
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
 
@@ -1324,6 +1428,11 @@ async function watchSubagent(
       sentinelFile: running.sentinelFile,
       onTick() {
         observeRunningSubagent(running);
+        const request = readSimulatedUserQuestionRequest(running.sessionFile);
+        if (request && request.requestId !== running.lastQuestionRequestId) {
+          running.lastQuestionRequestId = request.requestId;
+          hooks?.onQuestion?.(request);
+        }
       },
     });
 
@@ -1428,10 +1537,13 @@ async function watchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
-  // Capture the UI context for widget updates
+  let simulatedUserQuestionsEnabled = true;
+
+  // Capture the UI context for widget updates and restore session settings.
   pi.on("session_start", (_event, ctx) => {
     modulePollAbortLifecycle.startSession();
     latestCtx = ctx;
+    simulatedUserQuestionsEnabled = restoreSimulatedUserQuestionsSetting(ctx);
   });
 
   // Clean up on session shutdown
@@ -1522,7 +1634,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Launch the subagent (creates pane, sends command)
-        const running = await launchSubagent(params, ctx);
+        const running = await launchSubagent(params, ctx, {
+          simulatedUserQuestionsEnabled,
+        });
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -1534,7 +1648,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startStatusRefresh(pi);
 
         // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
+        watchSubagent(running, watcherAbort.signal, {
+          onQuestion: (request) => notifySimulatedUserQuestion(pi, running, request),
+        })
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
 
@@ -1724,6 +1840,172 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
+  // ── subagent_answer_question tool ──
+  if (shouldRegister("subagent_answer_question"))
+    pi.registerTool({
+      name: "subagent_answer_question",
+      label: "Answer Subagent Question",
+      description:
+        "Answer an ask_user_question call from a currently running managed subagent. " +
+        "Use the exact subagent id and request id from the automatic question notification. " +
+        "The answer is delivered into the child's existing tool call; the child pane remains open. " +
+        "Do not ask the real user and do not resume the child for these questions.",
+      promptSnippet:
+        "Answer an ask_user_question call from a currently running managed subagent. " +
+        "Use the exact subagent id and request id from the automatic question notification. " +
+        "The answer is delivered into the child's existing tool call; the child pane remains open. " +
+        "Do not ask the real user and do not resume the child for these questions.",
+      parameters: SubagentAnswerQuestionParams,
+
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        const running = runningSubagents.get(params.id);
+        if (!running) {
+          return {
+            content: [{ type: "text", text: `Error: no running subagent with id ${params.id}.` }],
+            details: { error: "subagent not found", id: params.id },
+          };
+        }
+
+        const request = readSimulatedUserQuestionRequest(running.sessionFile);
+        if (!request || request.requestId !== params.requestId) {
+          return {
+            content: [{ type: "text", text: `Error: no open question request ${params.requestId} for subagent ${params.id}.` }],
+            details: { error: "question not found", id: params.id, requestId: params.requestId },
+          };
+        }
+
+        const answer: SimulatedUserAnswer = {
+          version: 1,
+          requestId: request.requestId,
+          toolCallId: request.toolCallId,
+          ...(params.answers ? { answers: params.answers } : {}),
+          ...(params.globalNote !== undefined ? { globalNote: params.globalNote } : {}),
+          ...(params.cancel !== undefined ? { cancel: params.cancel } : {}),
+        };
+
+        removeSimulatedUserFile(getSimulatedUserAnswerResultPath(running.sessionFile));
+        writeJsonAtomic(getSimulatedUserAnswerPath(running.sessionFile), answer);
+        const verdict = await waitForSimulatedUserAnswerResult(
+          running.sessionFile,
+          request.requestId,
+          signal,
+        );
+
+        if (verdict && !verdict.ok) {
+          return {
+            content: [{ type: "text", text: `The child rejected the simulated answer: ${verdict.reason ?? verdict.code ?? "unknown reason"}` }],
+            details: { accepted: false, ...verdict },
+          };
+        }
+
+        const notification = formatSimulatedUserAnswerNotification(request, answer);
+        ctx.ui.notify(notification, "info");
+        return {
+          content: [{ type: "text", text: verdict ? "Simulated-user answer accepted." : "Simulated-user answer submitted." }],
+          details: {
+            accepted: verdict?.ok ?? null,
+            id: running.id,
+            name: running.name,
+            requestId: request.requestId,
+            answer: notification,
+          },
+        };
+      },
+
+      renderCall(args, theme) {
+        return new Text(
+          theme.fg("accent", "▸") +
+            " " +
+            theme.fg("toolTitle", theme.bold(args.id ?? "subagent")) +
+            theme.fg("dim", " — answer question"),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        if (details?.answer) {
+          return new Text(theme.fg("success", "✓") + " " + details.answer, 0, 0);
+        }
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+    });
+
+  // ── subagent_read_session tool ──
+  if (shouldRegister("subagent_read_session"))
+    pi.registerTool({
+      name: "subagent_read_session",
+      label: "Read Subagent Session",
+      description:
+        "Read raw JSONL entries from a subagent's Pi session file. " +
+        "Use id for a currently running subagent or sessionPath for a completed session. " +
+        "This is for transcript inspection, not completion polling.",
+      promptSnippet:
+        "Read raw JSONL entries from a subagent's Pi session file by running id or session path. " +
+        "Use for transcript inspection, not completion polling.",
+      parameters: SubagentReadSessionParams,
+
+      async execute(_toolCallId, params) {
+        if (!params.id && !params.sessionPath) {
+          return {
+            content: [{ type: "text", text: "Error: provide id or sessionPath." }],
+            details: { error: "missing target" },
+          };
+        }
+
+        const running = params.id ? runningSubagents.get(params.id) : undefined;
+        if (params.id && !running && !params.sessionPath) {
+          return {
+            content: [{ type: "text", text: `Error: no running subagent with id ${params.id}.` }],
+            details: { error: "subagent not found", id: params.id },
+          };
+        }
+
+        const sessionFile = params.sessionPath ?? running!.sessionFile;
+        if (!existsSync(sessionFile)) {
+          return {
+            content: [{ type: "text", text: `Error: session file not found: ${sessionFile}` }],
+            details: { error: "session not found", sessionFile },
+          };
+        }
+
+        const result = readSessionFileLines(sessionFile, params.offset ?? 1, params.limit ?? 200);
+        const range = result.endLine >= result.startLine
+          ? `Lines ${result.startLine}-${result.endLine} of ${result.totalLines}`
+          : `No lines at offset ${result.startLine}; session has ${result.totalLines} lines`;
+        return {
+          content: [{ type: "text", text: `${range}\n\n${result.text}`.trimEnd() }],
+          details: { sessionFile, ...result },
+        };
+      },
+
+      renderCall(args, theme) {
+        const target = args.id ?? args.sessionPath ?? "subagent session";
+        return new Text(
+          theme.fg("accent", "▸") + " " +
+            theme.fg("toolTitle", theme.bold(target)) +
+            theme.fg("dim", " — read session"),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        if (details?.sessionFile) {
+          return new Text(
+            theme.fg("dim", `${details.startLine}-${details.endLine} of ${details.totalLines} lines`),
+            0,
+            0,
+          );
+        }
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+    });
+
   // ── subagents_list tool ──
   if (shouldRegister("subagents_list"))
     pi.registerTool({
@@ -1865,6 +2147,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        const resumePrompt = params.message;
+
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
@@ -1883,22 +2167,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
 
-        let resumeMsgFile: string | undefined;
-        if (params.message) {
-          const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-          resumeMsgFile = join(
-            artifactDir,
-            "subagent-resume",
-            `${name
-              .toLowerCase()
-              .replace(/[^a-z0-9\s-]/g, "")
-              .replace(/\s+/g, "-")
-              .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
-          );
-          mkdirSync(dirname(resumeMsgFile), { recursive: true });
-          writeFileSync(resumeMsgFile, params.message, "utf8");
-          parts.push(shellEscape(`@${resumeMsgFile}`));
+        if (resumePrompt) {
+          // sendLongCommand already writes the complete shell command to a script,
+          // so the prompt can stay a normal positional message. Passing @file here
+          // would expose Pi's <file ...> wrapper to the resumed subagent.
+          parts.push(shellEscape(resumePrompt));
         }
 
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
@@ -1909,6 +2182,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_SIMULATED_USER=${simulatedUserQuestionsEnabled ? "1" : "0"}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
         if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
@@ -1933,7 +2207,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `# Generated: ${new Date().toISOString()}`,
             `# Session: ${params.sessionPath}`,
             `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
           ].join("\n"),
         });
 
@@ -1961,7 +2234,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        watchSubagent(running, watcherAbort.signal)
+        watchSubagent(running, watcherAbort.signal, {
+          onQuestion: (request) => notifySimulatedUserQuestion(pi, running, request),
+        })
           .then((result) => {
             updateWidget();
 
@@ -2037,6 +2312,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       },
     });
+
+  pi.registerCommand("subagent-simulated-user", {
+    description: "Enable, disable, or inspect parent-agent answers to child ask_user_question calls",
+    handler: async (args, ctx) => {
+      const action = args.trim().toLowerCase() || "status";
+
+      if (action === "on" || action === "off") {
+        simulatedUserQuestionsEnabled = action === "on";
+        pi.appendEntry(SIMULATED_USER_SETTING_ENTRY, {
+          enabled: simulatedUserQuestionsEnabled,
+        });
+      } else if (action !== "status") {
+        ctx.ui.notify("Usage: /subagent-simulated-user on|off|status", "warning");
+        return;
+      }
+
+      const state = simulatedUserQuestionsEnabled ? "enabled" : "disabled";
+      ctx.ui.notify(
+        `Simulated user questions are ${state} for future subagent launches and resumes.`,
+        "info",
+      );
+    },
+  });
 
   // /iterate command — fork the session into a subagent
   pi.registerCommand("iterate", {
@@ -2175,6 +2473,38 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         if (overflow > 0) {
           contentLines.push(theme.fg("muted", `+${overflow} more running.`));
+        }
+        if (!options.expanded) {
+          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
+        }
+
+        const box = new Box(1, 1, (text: string) => theme.bg("customMessageBg", text));
+        box.addChild(new Text(contentLines.join("\n"), 0, 0));
+        return ["", ...box.render(width)];
+      },
+    };
+  });
+
+  // ── subagent_question message renderer ──
+  pi.registerMessageRenderer("subagent_question", (message, options, theme) => {
+    const details = message.details as any;
+    if (!details) return undefined;
+
+    return {
+      render(width: number): string[] {
+        const name = details.name ?? "subagent";
+        const questions = Array.isArray(details.questions) ? details.questions : [];
+        const contentLines = [
+          `${theme.fg("accent", "?")} ${theme.fg("toolTitle", theme.bold(name))} ${theme.fg("dim", "— awaiting simulated answer")}`,
+        ];
+
+        const visibleQuestions = options.expanded ? questions : questions.slice(0, 1);
+        for (const question of visibleQuestions) {
+          contentLines.push("");
+          contentLines.push(question.question ?? "");
+          for (const option of question.options ?? []) {
+            contentLines.push(theme.fg("dim", `• ${option.label}`));
+          }
         }
         if (!options.expanded) {
           contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
