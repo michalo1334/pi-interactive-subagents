@@ -128,6 +128,10 @@ function createMockExtensionApi() {
         registeredMessageRenderers.push({ name, renderer });
       },
       registerShortcut() {},
+      registerFlag() {},
+      getFlag() {
+        return undefined;
+      },
       sendUserMessage(message: string) {
         sentUserMessages.push(message);
       },
