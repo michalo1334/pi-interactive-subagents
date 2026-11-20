@@ -191,7 +191,7 @@ export default function (pi: ExtensionAPI) {
 
         if (expanded) {
           // Expanded: full tool list + denied
-          const countInfo = theme.fg("dim", ` — ${toolNames.length} available`);
+          const countInfo = theme.fg("dim", ` — ${toolNames.length} active tools`);
           const hint = theme.fg("muted", "  (Ctrl+J to collapse)");
 
           const toolList = toolNames
@@ -214,7 +214,7 @@ export default function (pi: ExtensionAPI) {
           box.addChild(content);
         } else {
           // Collapsed: one-line summary
-          const countInfo = theme.fg("dim", ` — ${toolNames.length} tools`);
+          const countInfo = theme.fg("dim", ` — ${toolNames.length} active tools`);
           const deniedInfo =
             denied.length > 0
               ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} denied`)
@@ -254,8 +254,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     recorder.sessionStart();
-    const tools = pi.getAllTools();
-    toolNames = tools.map((t) => t.name).sort();
+    toolNames = pi.getActiveTools().sort();
     denied = parseDeniedTools(deniedToolsValue);
 
     renderWidget(ctx, null);

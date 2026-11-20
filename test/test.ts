@@ -141,7 +141,7 @@ function createMockExtensionApi() {
       appendEntry(customType: string, data: any) {
         appendedEntries.push({ customType, data });
       },
-      getAllTools() {
+      getActiveTools() {
         return [];
       },
       events: {
